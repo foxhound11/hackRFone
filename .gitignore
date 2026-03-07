@@ -1,0 +1,21 @@
+# Logs
+*.log
+*_log.txt
+action_traces.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+
+# RF Captures & Binaries
+*.iq
+*.exe
+*.zip
+hackrf-old/
+hackrf_sa/
+hackrf_tools/
+PothosSDR-installer.exe
