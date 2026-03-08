@@ -1,8 +1,10 @@
 import requests
 import json
 import os
+from dotenv import load_dotenv
 
-OPENROUTER_KEY = "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"
+load_dotenv()
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
 prompt = """
 You are an expert AI Red Teamer. You need to write an ARIA-aligned Technical Report for a hackathon submission.
