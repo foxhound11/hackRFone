@@ -27,13 +27,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
-WS_URI = "ws://localhost:8889"
+WS_URI = "ws://localhost:8081"  # Default, can be overridden by --port
 LLM_INTERVAL = 5  # Call LLM every N sweeps
 ACTION_LOG_FILE = "action_traces.json"
 
 sweep_counter = 0
 action_traces = []
 llm_history = []  # Rolling context: last 3 LLM responses
+
+AGENT_CONFIG = {
+    "llm_enabled": True,
+    "rtl433_enabled": True,
+    "fft_enabled": False,
+    "alerts_enabled": True
+}
 
 
 # ──────────────────────────────── IMPORTS ────────────────────────────────────
@@ -213,10 +220,9 @@ async def ask_llm_decision(events, active_emitters):
         interesting_events = [e for e in events if e['type'] == 'PERSISTENT']
         
     event_list = "\n".join([
-        f"  - {e['type']} at {e['freq_mhz']:.3f} MHz | SNR: {e['snr']:.1f} dB | Hits: {e['hits']}"
+        f"  - {e['type']} at {e['freq_mhz']:.3f} MHz | SNR: {e['snr']:.1f} dB"
         f" | Catalogue: {', '.join(e.get('catalogue', {}).get('likely_devices', ['Unknown'])[:2])}"
-        f" ({e.get('catalogue', {}).get('modulation', '?')})"
-        f" | Flipper: {e.get('catalogue', {}).get('flipper_capability', '?')}"
+        f" | Decode: {e.get('rtl_decode', 'None')} | Modulation: {e.get('fft_mod', 'Unknown')}"
         for e in interesting_events[:15]
     ])
 
@@ -232,16 +238,13 @@ async def ask_llm_decision(events, active_emitters):
 
     prompt = f"""You are RECON-1, an autonomous RF threat assessment agent conducting live spectrum surveillance.
 
-You are monitoring 300-500 MHz. You receive temporal EVENT logs annotated with a frequency-band catalogue.
-- "TRANSIENT_BURST" = short transmission (like a key fob press, 1-3 sweeps)
-- "APPEARED" = brand new signal not seen before
-- "PERSISTENT" = continuous carrier (TV station, telemetry — usually boring)
+You are monitoring 300-500 MHz.
+IMPORTANT NEW CONTEXT: As soon as a signal appears, our hardware automatically captures it and attempts to decode it.
+The event list below contains the CONCRETE CONFIRMED RESULTS of those captures under the "Decode" and "Modulation" fields.
 
-IMPORTANT: The Catalogue column shows what devices COMMONLY use that frequency band.
-This is frequency matching ONLY — we have NOT demodulated or fingerprinted the signal.
-A signal at 433.92 MHz COULD be a key fob, OR it could be a weather station, a spoofed
-replay attack, or any other device using that ISM band. Always use "Likely:" prefix in
-your device_type field and note the uncertainty.
+- If "Decode" says something specific (e.g. "CONFIRMED: Nissan TPMS"), this is 100% ground truth. Do NOT guess the device type, use the confirmed decode.
+- If "Modulation" is "OOK", understand that OOK is trivially vulnerable to replay attacks (unlike FSK).
+- "Catalogue" is just a backup frequency-band guess. Ignore the catalogue if a "Decode" exists.
 
 Recent Events:
 {event_list}
@@ -250,27 +253,18 @@ Active emitters in session: {len(active_emitters)}
 {db_stats}
 {context}
 
-FLIPPER ZERO CONTEXT: We have a Flipper Zero available for replay attacks.
-The Flipper capability (REPLAY_TRIVIAL, REPLAY_POSSIBLE, MONITOR_ONLY) indicates
-what the Flipper can do with signals in each band. Factor this into threat assessment.
-rtl_433 status: {"AVAILABLE" if rtl_433_integration.IS_AVAILABLE else "NOT INSTALLED — device IDs are frequency guesses only"}
-
 For EACH interesting event:
-1. What device LIKELY produces this signal (prefix with "Likely:" — we have not demodulated)
-2. Threat level: CRITICAL (Flipper can replay trivially), MEDIUM (Flipper can potentially replay), LOW (Flipper cannot exploit)
-3. Brief tactical assessment
-4. Can the Flipper Zero exploit this? (based on flipper_capability)
-
-RECOMMENDATION: If a suspicious TRANSIENT or APPEARED event exists with REPLAY_TRIVIAL capability, recommend FOCUS on that frequency for rtl_433 decode. Otherwise recommend SCAN.
+1. What device produces this signal? (Use "CONFIRMED: [Decode]" if decode exists, otherwise use "Likely: [Catalogue]").
+2. Threat level: CRITICAL (OOK/trivially replayable), MEDIUM (Unknown/potentially exploitable), LOW (noise/unexploitable).
+3. Brief tactical assessment.
 
 Respond ONLY with this JSON (no markdown):
 {{
   "signals": [
-    {{"freq_mhz": 433.92, "device_type": "Likely: ...", "threat_level": "CRITICAL|MEDIUM|LOW", "assessment": "...", "flipper_exploitable": true}}
+    {{"freq_mhz": 433.92, "device_type": "...", "threat_level": "CRITICAL|MEDIUM|LOW", "assessment": "..."}}
   ],
-  "commentary": "First-person tactical narrative focusing on what changed since last analysis.",
-  "action": "FOCUS" or "SCAN",
-  "focus_freq_mhz": 433.92
+  "commentary": "First-person tactical narrative focusing on the newly confirmed decoded data.",
+  "action": "SCAN"
 }}"""
 
     try:
@@ -300,10 +294,10 @@ Respond ONLY with this JSON (no markdown):
         if len(llm_history) > 5:
             llm_history = llm_history[-3:]
         
-        return result
+        return result, prompt, text.strip()
     except Exception as e:
         print(f"[LLM ERROR] {e}")
-        return None
+        return None, None, None
 
 
 # ──────────────────────────────── LEARN MODE ────────────────────────────────
@@ -351,12 +345,84 @@ async def learn_baseline(num_sweeps=30):
         print(f"[LEARN] Error: {e}")
 
 
+async def capture_and_analyze(ws, freq):
+    """Pause sweep, capture IQ data, and run rtl_433 and signal_analysis."""
+    await log_to_dash(ws, f"ACTION: AUTO-CAPTURE on {freq} MHz")
+    await send_agent_status(ws, "CAPTURING", f"{freq} MHz")
+
+    capture_file = os.path.join("captures", f"focus_{int(freq*1e6)}_hz.iq")
+    os.makedirs("captures", exist_ok=True)
+    hackrf_transfer = r"C:\Program Files\PothosSDR\bin\hackrf_transfer.exe"
+    sample_rate = 2000000
+    num_samples = sample_rate * 2  # 2 seconds
+
+    await log_to_dash(ws, f"CAPTURE: Recording {freq} MHz for 2 seconds...")
+    await ws.send(json.dumps({"type": "CMD", "action": "PAUSE_SWEEP"}))
+    await asyncio.sleep(0.5)
+
+    capture_ok = False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            hackrf_transfer, "-r", capture_file, "-f", str(int(freq * 1e6)),
+            "-s", str(sample_rate), "-n", str(num_samples), "-l", "32", "-g", "20",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=10)
+        capture_ok = os.path.exists(capture_file) and os.path.getsize(capture_file) > 1000
+        if capture_ok:
+            await log_to_dash(ws, f"CAPTURE: Saved {os.path.getsize(capture_file)} bytes to {capture_file}")
+        else:
+            err = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else "unknown"
+            await log_to_dash(ws, f"CAPTURE FAILED: {err}")
+    except Exception as e:
+        await log_to_dash(ws, f"CAPTURE ERROR: {e}")
+
+    await ws.send(json.dumps({"type": "CMD", "action": "RESUME_SWEEP"}))
+
+    decode_result = None
+    iq_result = None
+    proto = None
+
+    if capture_ok and rtl_433_integration.IS_AVAILABLE and AGENT_CONFIG["rtl433_enabled"]:
+        await send_agent_status(ws, "DECODING", f"rtl_433 on {freq} MHz")
+        await log_to_dash(ws, f"RTL_433: Decoding captured IQ file...")
+        decode_result = await rtl_433_integration.decode_iq_file(capture_file, freq_hz=int(freq * 1e6), sample_rate=sample_rate)
+        if decode_result and decode_result.get("decoded"):
+            d = decode_result["decoded"][0]
+            proto = d.get("protocol", "Unknown")
+            dev_id = d.get("id", "?")
+            await log_to_dash(ws, f"RTL_433 CONFIRMED: {proto} (ID: {dev_id})")
+            emitter_db.upsert_emitter(freq, 0, 0, agent_label=f"CONFIRMED: {proto}")
+        else:
+            await log_to_dash(ws, f"RTL_433: No known protocols decoded at {freq} MHz")
+
+    if capture_ok and HAS_SIGNAL_ANALYSIS and AGENT_CONFIG["fft_enabled"]:
+        await send_agent_status(ws, "FFT", f"Analyzing {freq} MHz")
+        iq_result = signal_analysis.analyze_iq_file(capture_file, sample_rate=sample_rate)
+        if iq_result and iq_result.get("detected"):
+            mod = iq_result.get("modulation", "UNKNOWN")
+            bursts = iq_result.get("burst_count", 0)
+            await log_to_dash(ws, f"IQ ANALYSIS: {mod} modulation, {bursts} bursts")
+            await ws.send(json.dumps({
+                "type": "IQ_DIAGNOSTICS", "freq_mhz": freq, "modulation": mod,
+                "bursts": bursts, "confidence": iq_result.get("confidence", 0),
+                "fsk_dev": iq_result.get("fsk_deviation_khz", 0),
+                "fft_peaks": iq_result.get("fft_peaks", [])
+            }))
+            
+    await send_agent_status(ws, "SCANNING", "Passive monitoring")
+    return proto, iq_result
+
 # ──────────────────────────────── MAIN AGENT LOOP ───────────────────────────
 
 async def agent_loop():
     global sweep_counter
     memory = EmitterMemory()
     event_buffer = []
+    
+    # Rate limiting for auto-capture
+    last_capture_time = 0
+    captured_freqs = set()
 
     print(f"Connecting to dashboard at {WS_URI}...")
     try:
@@ -370,6 +436,15 @@ async def agent_loop():
             async for message in ws:
                 data = json.loads(message)
 
+                if data.get("type") == "SETTINGS":
+                    global AGENT_CONFIG
+                    AGENT_CONFIG["llm_enabled"] = data.get("llm_enabled", True)
+                    AGENT_CONFIG["rtl433_enabled"] = data.get("rtl433_enabled", True)
+                    AGENT_CONFIG["fft_enabled"] = data.get("fft_enabled", True)
+                    AGENT_CONFIG["alerts_enabled"] = data.get("alerts_enabled", True)
+                    await log_to_dash(ws, "SYSTEM: Agent Feature configuration securely updated via Dashboard.")
+                    continue
+
                 if data.get("type") != "sweep":
                     continue
 
@@ -377,6 +452,39 @@ async def agent_loop():
                 peaks = data.get("peaks", [])
 
                 new_events = memory.process_sweep(peaks)
+                
+                # --- AUTO-CAPTURE: DEMO MODE ---
+                # ONLY capture in 433-434 MHz (ISM band where Flipper transmits)
+                # Hard cap: 3 captures per session, 30s cooldown between captures
+                CAPTURE_RANGE = (433.0, 434.0)
+                MAX_CAPTURES = 3
+                CAPTURE_COOLDOWN = 30
+                
+                now = time.time()
+                best_candidate = None
+                
+                if len(captured_freqs) < MAX_CAPTURES and (now - last_capture_time > CAPTURE_COOLDOWN):
+                    for event in new_events:
+                        if event['type'] in ('TRANSIENT_BURST', 'APPEARED'):
+                            f = event['freq_mhz']
+                            if CAPTURE_RANGE[0] <= f <= CAPTURE_RANGE[1] and event.get('snr', 0) >= 12:
+                                if best_candidate is None or event.get('snr', 0) > best_candidate.get('snr', 0):
+                                    best_candidate = event
+                
+                if best_candidate:
+                    freq = best_candidate['freq_mhz']
+                    captured_freqs.add(round(freq, 1))
+                    last_capture_time = time.time()
+                    await log_to_dash(ws, f"⚡ DEMO CAPTURE #{len(captured_freqs)}/{MAX_CAPTURES} — targeting {freq:.3f} MHz")
+                    
+                    proto, iq_result = await capture_and_analyze(ws, freq)
+                    
+                    if proto:
+                        best_candidate['rtl_decode'] = proto
+                    if iq_result and iq_result.get('detected'):
+                        best_candidate['fft_mod'] = iq_result.get('modulation', 'UNKNOWN')
+                        best_candidate['fft_bursts'] = iq_result.get('burst_count', 0)
+                
                 event_buffer.extend(new_events)
 
                 # Every N sweeps, send accumulated events to LLM
@@ -389,17 +497,27 @@ async def agent_loop():
                         await send_agent_status(ws, "SCANNING", "No new events")
                         continue
 
+                    if not AGENT_CONFIG["llm_enabled"]:
+                        await log_to_dash(ws, f"Sweep #{sweep_counter} | LLM Analysis disabled by dashboard override. Skipping {len(event_buffer)} events.")
+                        event_buffer = []
+                        continue
+
                     await log_to_dash(ws, f"Sweep #{sweep_counter} | {len(memory.emitters)} session / {emitter_db.get_emitter_count()} DB emitters. Analyzing {len(event_buffer)} events...")
-                    await send_agent_status(ws, "ANALYZING", f"{len(event_buffer)} events")
+                    await send_agent_status(ws, "EVALUATING", f"{len(event_buffer)} events")
 
                     try:
-                        result = await asyncio.wait_for(ask_llm_decision(event_buffer, memory.emitters), timeout=30)
+                        result, llm_prompt, llm_response = await asyncio.wait_for(ask_llm_decision(event_buffer, memory.emitters), timeout=30)
                     except asyncio.TimeoutError:
                         await log_to_dash(ws, "LLM timeout. Will retry next cycle.")
                         event_buffer = []
                         continue
 
                     if result:
+                        await ws.send(json.dumps({
+                            "type": "LLM_TRACE", 
+                            "prompt": llm_prompt, 
+                            "response": llm_response
+                        }))
                         save_action_trace(sweep_counter, event_buffer, result)
                         
                         # Update DB with LLM labels
@@ -430,60 +548,12 @@ async def agent_loop():
                         if commentary:
                             await log_to_dash(ws, f"RECON-1: {commentary}")
 
-                        action = result.get("action", "SCAN")
-                        if action == "FOCUS":
-                            freq = result.get("focus_freq_mhz")
-                            if freq:
-                                await log_to_dash(ws, f"ACTION: FOCUS on {freq} MHz")
-                                await send_agent_status(ws, "FOCUSING", f"{freq} MHz")
-                                await ws.send(json.dumps({"type": "CMD", "action": "CAPTURE", "freq_hz": int(freq*1e6)}))
-                                
-                                # === RTL_433 SIGNAL IDENTIFICATION ===
-                                if rtl_433_integration.IS_AVAILABLE:
-                                    await log_to_dash(ws, f"RTL_433: Decoding signals at {freq} MHz...")
-                                    decode_result = await rtl_433_integration.decode_frequency_live(
-                                        freq_hz=int(freq * 1e6), duration_sec=5
-                                    )
-                                    if decode_result.get("decoded"):
-                                        for d in decode_result["decoded"]:
-                                            proto = d.get("protocol", "Unknown")
-                                            dev_id = d.get("id", "?")
-                                            await log_to_dash(ws, f"RTL_433 CONFIRMED: {proto} (ID: {dev_id})")
-                                            # Update DB with confirmed device identity
-                                            emitter_db.upsert_emitter(
-                                                freq, 0, 0,
-                                                agent_label=f"CONFIRMED: {proto}",
-                                                threat_level=result.get("signals", [{}])[0].get("threat_level", "")
-                                            )
-                                    else:
-                                        await log_to_dash(ws, f"RTL_433: No known protocols decoded at {freq} MHz")
-                                else:
-                                    await log_to_dash(ws, "RTL_433: Not installed — device ID is frequency guess only")
-                                
-                                # === IQ SIGNAL ANALYSIS (if capture file exists) ===
-                                import glob
-                                iq_files = glob.glob("captures/*.raw") + glob.glob("captures/*.iq")
-                                if iq_files and HAS_SIGNAL_ANALYSIS:
-                                    latest_iq = max(iq_files, key=os.path.getmtime)
-                                    iq_result = signal_analysis.analyze_iq_file(latest_iq)
-                                    if iq_result.get("detected"):
-                                        mod = iq_result.get("modulation", "UNKNOWN")
-                                        replayable = iq_result.get("replayable", False)
-                                        bursts = iq_result.get("burst_count", 0)
-                                        await log_to_dash(ws, f"IQ ANALYSIS: {mod} modulation, {bursts} bursts, replayable={replayable}")
-                                        if replayable:
-                                            await log_to_dash(ws, f"WARNING: Signal at {freq} MHz appears to use static OOK — Flipper Zero can replay")
-                                            await ws.send(json.dumps({"type": "ALERT", "level": "CRITICAL",
-                                                "message": f"REPLAYABLE signal at {freq} MHz ({mod}, {bursts} bursts)"}))
-                        else:
-                            await log_to_dash(ws, "ACTION: Continue SCAN")
-                            await send_agent_status(ws, "SCANNING", "Passive monitoring")
-
                         # Desktop alert for critical threats
                         crits = [s for s in result.get("signals", []) if s.get("threat_level") == "CRITICAL" or s.get("threat") == "CRITICAL"]
                         if crits:
                             freq_str = ", ".join(f"{s.get('freq_mhz', 0):.1f} MHz" for s in crits)
-                            desktop_alert("CRITICAL RF THREAT", f"Detected at {freq_str}")
+                            if AGENT_CONFIG["alerts_enabled"]:
+                                desktop_alert("CRITICAL RF THREAT", f"Detected at {freq_str}")
                             await ws.send(json.dumps({"type": "ALERT", "level": "CRITICAL", "message": f"Critical threat at {freq_str}"}))
 
                     else:
@@ -497,9 +567,13 @@ async def agent_loop():
 
 
 async def main():
+    global WS_URI
     parser = argparse.ArgumentParser(description="RECON-1 RF Agent")
     parser.add_argument("--learn", type=int, default=0, help="Enter baseline learning mode for N sweeps")
+    parser.add_argument("--port", type=int, default=8080, help="Dashboard HTTP port (default 8080)")
     args = parser.parse_args()
+    
+    WS_URI = f"ws://localhost:{args.port + 1}"
     
     if args.learn > 0:
         await learn_baseline(args.learn)

@@ -44,7 +44,7 @@ except ImportError:
 DEFAULT_PORT = 8080
 WS_PORT_OFFSET = 1  # websocket runs on port+1
 SWEEP_CMD = r"C:\Program Files\PothosSDR\bin\hackrf_sweep.exe"
-SWEEP_ARGS = ["-f", "300:500", "-l", "32", "-g", "20", "-w", "100000"]
+SWEEP_ARGS = ["-f", "420:450", "-l", "32", "-g", "20", "-w", "100000"]
 PEAK_THRESHOLD_DB = 10  # dB above noise floor to count as peak
 
 # ──────────────────────────────── HTML / JS / CSS ──────────────────────────────
@@ -110,11 +110,24 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--m
 #emitter-table td{padding:4px 8px;border-bottom:1px solid #0f1018}
 #emitter-table tr:hover{background:#ffffff05}
 #emitter-table .baseline{opacity:0.45}
+.ai-tab { padding:8px 14px; cursor:pointer; font-size:10px; letter-spacing:2px; flex:1; text-align:center; border-bottom:1px solid var(--border); border-right:1px solid var(--border); color:var(--text-dim); transition: 0.2s;}
+.ai-tab:last-child { border-right: none; }
+.ai-tab.active { color:var(--cyan); background:var(--panel); border-bottom-color:transparent; font-weight:bold; }
+.ai-trace-block { background:#0a0d14; border:1px solid var(--border); padding:8px; margin-bottom:8px; border-radius:4px; }
+.ai-trace-title { display:flex; justify-content:space-between; color:var(--cyan); font-weight:bold; margin-bottom:6px; border-bottom:1px solid #222; padding-bottom:6px; }
+.ai-trace-content { white-space:pre-wrap; word-break:break-word; color:#a0aabf; font-size:10px; line-height: 1.4;}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px}
 .dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
 .dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
 .dot-amber{background:var(--amber);box-shadow:0 0 6px var(--amber)}
 .dot-dim{background:#444}
+.pipeline { display: flex; align-items: center; gap: 4px; font-family: 'JetBrains Mono', monospace; font-size: 9px; margin-left: auto; margin-right: 20px;}
+.pipe-step { padding: 3px 6px; border-radius: 3px; color: var(--text-dim); background: #1a1e29; transition: all 0.2s; }
+.pipe-step.active { color: #000; background: var(--cyan); box-shadow: 0 0 8px var(--cyan); font-weight: bold; }
+.pipe-arrow { color: var(--text-dim); }
+.settings-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 12px; font-size: 10px; color: var(--text-dim); }
+.settings-row input[type="checkbox"] { accent-color: var(--cyan); margin: 0; cursor: pointer; }
+.settings-row label { cursor: pointer; flex: 1; }
 #logpanel{grid-area:logpanel;border-top:1px solid var(--border);padding:6px 14px;overflow-y:auto;
   font-size:10px;line-height:1.6;background:#060710}
 #logpanel .log-line{white-space:nowrap}
@@ -138,9 +151,16 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--m
 <div id="app">
   <div id="topbar">
     <h1>&#9654; RECON-1</h1>
-    <div class="meta">
-      <span id="agent-mode" class="scanning">SCANNING</span>
-      <span id="agent-detail" style="color:var(--text-dim);font-size:9px"></span>
+    <div class="meta" style="flex:1; display:flex; align-items:center;">
+      <div class="pipeline" id="recon-pipeline">
+        <span class="pipe-step active" id="pipe-SCAN">SCAN</span> <span class="pipe-arrow">▶</span>
+        <span class="pipe-step" id="pipe-FOCUS">FOCUS</span> <span class="pipe-arrow">▶</span>
+        <span class="pipe-step" id="pipe-CAPTURE">CAPTURE</span> <span class="pipe-arrow">▶</span>
+        <span class="pipe-step" id="pipe-DECODE">RTL-433</span> <span class="pipe-arrow">▶</span>
+        <span class="pipe-step" id="pipe-FFT">FFT</span> <span class="pipe-arrow">▶</span>
+        <span class="pipe-step" id="pipe-LLM">LLM</span>
+      </div>
+      <span id="agent-detail" style="color:var(--text-dim);font-size:9px;margin-right:15px;min-width:60px"></span>
       <span id="clock">00:00:00</span>
       <span>SWEEPS <span id="sweep-count">0</span></span>
       <span>DB <span id="db-count" style="color:var(--green)">0</span></span>
@@ -149,14 +169,35 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--m
   </div>
   <div id="spectrum-panel"><canvas id="spectrumChart"></canvas></div>
   <div id="sidebar">
-    <div id="sidebar-header">AI INTELLIGENCE <span id="target-count" style="color:var(--green)">0</span></div>
-    <div id="ai-panel"><div style="color:var(--text-dim);font-size:10px;padding:12px">Waiting for RECON-1 analysis...</div></div>
+    <div id="ai-section" style="flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden;">
+      <div id="sidebar-header" style="padding:0; display:flex; background:var(--panel2)">
+        <div class="ai-tab active" id="tab-cards" onclick="switchTab('cards')">THREAT CARDS <span id="target-count" style="color:var(--green);font-size:9px;margin-left:6px">0</span></div>
+        <div class="ai-tab" id="tab-trace" onclick="switchTab('trace')">RAW LLM TRACE</div>
+      </div>
+      <div id="ai-panel" style="flex:1; overflow-y:auto; padding:8px 10px"><div style="color:var(--text-dim);font-size:10px;padding:4px">Waiting for RECON-1 analysis...</div></div>
+      <div id="llm-trace-panel" style="display:none; flex:1; overflow-y:auto; padding:8px 10px;">
+        <div style="color:var(--text-dim);font-size:10px;padding:4px;text-align:center;">No LLM traces yet...</div>
+      </div>
+    </div>
+    <div id="iq-section" style="flex: 0 0 250px; display: flex; flex-direction: column; border-top: 1px solid var(--border); overflow: hidden;">
+      <div id="sidebar-header">IQ DIAGNOSTICS (FFT)</div>
+      <div id="iq-panel" style="padding:12px; font-size:11px; overflow-y:auto; flex: 1;">
+        <div style="color:var(--text-dim);font-style:italic">Awaiting FOCUS capture...</div>
+      </div>
+    </div>
+    <div id="settings-section" style="flex: 0 0 auto; border-top: 1px solid var(--border); background: #0b0d17; padding-bottom: 8px;">
+      <div id="sidebar-header">AGENT OVERRIDES</div>
+      <div class="settings-row"><label for="toggle-llm">Use LLM Analysis</label><input type="checkbox" id="toggle-llm" checked></div>
+      <div class="settings-row"><label for="toggle-rtl433">Use rtl_433 Decoder</label><input type="checkbox" id="toggle-rtl433" checked></div>
+      <div class="settings-row"><label for="toggle-fft">Run FFT Diagnostics</label><input type="checkbox" id="toggle-fft"></div>
+      <div class="settings-row"><label for="toggle-alerts">Desktop Alerts</label><input type="checkbox" id="toggle-alerts" checked></div>
+    </div>
   </div>
   <div id="emitter-panel">
-    <div id="emitter-header">EMITTER DATABASE <span id="emitter-stats" style="color:var(--text-dim);font-size:9px">0 total / 0 baseline</span></div>
+    <div id="emitter-header">TARGET LEDGER & PROVENANCE <span id="emitter-stats" style="color:var(--text-dim);font-size:9px">0 records</span></div>
     <div id="emitter-table-wrap">
       <table id="emitter-table">
-        <thead><tr><th></th><th>FREQ</th><th>LABEL</th><th>HITS</th><th>SNR</th><th>THREAT</th><th>LAST SEEN</th></tr></thead>
+        <thead><tr><th></th><th>FREQ</th><th>RTL-433 DECODE</th><th>FFT OUTCOME</th><th>LLM EVALUATION</th><th>LAST SEEN</th></tr></thead>
         <tbody id="emitter-tbody"></tbody>
       </table>
     </div>
@@ -207,6 +248,24 @@ var peakPlugin={
 };
 Chart.register(peakPlugin);
 
+// Handle Settings Toggles
+function sendSettings() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "SETTINGS",
+      llm_enabled: document.getElementById('toggle-llm').checked,
+      rtl433_enabled: document.getElementById('toggle-rtl433').checked,
+      fft_enabled: document.getElementById('toggle-fft').checked,
+      alerts_enabled: document.getElementById('toggle-alerts').checked
+    }));
+  }
+}
+
+document.getElementById('toggle-llm').addEventListener('change', sendSettings);
+document.getElementById('toggle-rtl433').addEventListener('change', sendSettings);
+document.getElementById('toggle-fft').addEventListener('change', sendSettings);
+document.getElementById('toggle-alerts').addEventListener('change', sendSettings);
+
 function addLog(msg,cls){
   cls=cls||'scan';
   var panel=document.getElementById('logpanel');
@@ -248,35 +307,91 @@ function renderAIPanel(data){
   panel.innerHTML=html;
 }
 
+function renderLLMTrace(data) {
+  var panel = document.getElementById('llm-trace-panel');
+  if (!panel) return;
+  var html = '<div style="margin-bottom: 10px; border-bottom: 2px solid #330033; padding-bottom: 5px;">';
+  html += '<span style="color:var(--text-dim); font-size:10px;">' + new Date().toLocaleTimeString() + '<\/span><br>';
+  html += '<strong style="color:var(--magenta)">RAW PROMPT SENT:<\/strong><br>';
+  html += '<pre style="white-space:pre-wrap; font-size:11px; color:#ccc; max-height:200px; overflow-y:auto; background:#111; padding:5px; margin-top:5px;">' + (data.prompt || 'No prompt provided').replace(/</g, "&lt;").replace(/>/g, "&gt;") + '<\/pre>';
+  html += '<\/div>';
+
+  html += '<div style="margin-bottom: 20px;">';
+  html += '<strong style="color:var(--cyan)">RAW LLM RESPONSE:<\/strong><br>';
+  html += '<pre style="white-space:pre-wrap; font-size:11px; color:#ccc; max-height:200px; overflow-y:auto; background:#111; padding:5px; margin-top:5px;">' + (data.response || 'No response provided').replace(/</g, "&lt;").replace(/>/g, "&gt;") + '<\/pre>';
+  html += '<\/div>';
+
+  panel.innerHTML = html + panel.innerHTML;
+  
+  var children = panel.children;
+  if(children.length > 10) {
+     for(var i=children.length-1; i>=10; i--) {
+        panel.removeChild(children[i]);
+     }
+  }
+}
+
+
 function renderEmitterTable(data){
   var tbody=document.getElementById('emitter-tbody');
-  document.getElementById('emitter-stats').textContent=data.total+' total / '+data.baseline_count+' baseline';
+  document.getElementById('emitter-stats').textContent=data.total+' total targets';
   document.getElementById('db-count').textContent=data.total;
   var html='';
   var emitters=(data.emitters||[]).slice(0,50);
   for(var i=0;i<emitters.length;i++){
     var e=emitters[i];
-    var isBase=e.is_baseline?'baseline':'';
-    var threat=(e.threat_level||'').toLowerCase();
-    var dotClass=threat==='critical'?'dot-red':(threat==='medium'?'dot-amber':(e.is_baseline?'dot-dim':'dot-green'));
-    var label=e.agent_label||e.user_label||'';
+    var threat=(e.threat_level||'LOW').toLowerCase();
+    var dotClass=threat==='critical'?'dot-red':(threat==='medium'?'dot-amber':'dot-green');
+    
+    // Parse the agent label specifically to split out RTL vs Freq Guess
+    var rawLabel=e.agent_label||e.user_label||'';
+    var rtlDecode = '<span style="color:var(--text-dim)">-</span>';
+    var fftDecode = '<span style="color:var(--text-dim)">-</span>';
+    
+    if (rawLabel.indexOf("CONFIRMED:") === 0) {
+        rtlDecode = '<span style="color:var(--cyan);font-weight:bold">' + rawLabel.replace("CONFIRMED: ", "") + '</span>';
+    } else if (rawLabel.indexOf("Likely:") === 0) {
+        rtlDecode = '<span style="color:var(--text-dim);font-size:9px">Freq Guess: ' + rawLabel.replace("Likely: ", "") + '</span>';
+    } else if (rawLabel !== '') {
+        rtlDecode = rawLabel;
+    }
+
     var lastSeen=e.last_seen?new Date(e.last_seen).toLocaleTimeString():'';
-    html+='<tr class="'+isBase+'"><td><span class="dot '+dotClass+'"><\/span><\/td>';
-    html+='<td style="color:var(--green);font-weight:700">'+e.freq_mhz.toFixed(1)+'<\/td>';
-    html+='<td>'+label+'<\/td><td>'+e.total_hits+'<\/td><td>'+e.max_snr.toFixed(1)+'<\/td>';
-    html+='<td><span class="threat-badge '+threat+'">'+(e.threat_level||'').toUpperCase()+'<\/span><\/td>';
+    html+='<tr><td><span class="dot '+dotClass+'"><\/span><\/td>';
+    html+='<td style="color:var(--green);font-weight:700">'+e.freq_mhz.toFixed(2)+'<\/td>';
+    html+='<td>'+rtlDecode+'<\/td><td>'+fftDecode+'<\/td>';
+    html+='<td><span class="threat-badge '+threat+'">'+(e.threat_level||'LOW').toUpperCase()+'<\/span><\/td>';
     html+='<td style="color:var(--text-dim)">'+lastSeen+'<\/td><\/tr>';
   }
   tbody.innerHTML=html;
 }
 
+function switchTab(tabId) {
+  document.getElementById('tab-cards').className = (tabId === 'cards') ? 'ai-tab active' : 'ai-tab';
+  document.getElementById('tab-trace').className = (tabId === 'trace') ? 'ai-tab active' : 'ai-tab';
+  document.getElementById('ai-panel').style.display = (tabId === 'cards') ? 'block' : 'none';
+  document.getElementById('llm-trace-panel').style.display = (tabId === 'trace') ? 'block' : 'none';
+}
+
 function handleAgentStatus(data){
-  var el=document.getElementById('agent-mode');
   var detail=document.getElementById('agent-detail');
   var mode=(data.mode||'SCANNING').toUpperCase();
-  el.textContent=mode;
-  el.className=mode.toLowerCase();
   detail.textContent=data.detail||'';
+  
+  // Pipeline visualizer mapping
+  var activeStep = 'SCAN';
+  if (mode === 'FOCUSING') activeStep = 'FOCUS';
+  else if (mode === 'CAPTURING') activeStep = 'CAPTURE';
+  else if (mode === 'DECODING') activeStep = 'DECODE';
+  else if (mode === 'FFT') activeStep = 'FFT';
+  else if (mode === 'EVALUATING') activeStep = 'LLM';
+  
+  // Update UI
+  const steps = ['SCAN', 'FOCUS', 'CAPTURE', 'DECODE', 'FFT', 'LLM'];
+  steps.forEach(s => {
+      const el = document.getElementById('pipe-' + s);
+      if (el) el.className = (s === activeStep) ? 'pipe-step active' : 'pipe-step';
+  });
 }
 
 function handleAlert(data){
@@ -298,9 +413,26 @@ function connect(){
     if(d.type==='sweep') handleSweep(d);
     else if(d.type==='LOG') addLog(d.msg, d.msg.indexOf('RECON-1')>=0?'ai':(d.msg.indexOf('ACTION')>=0?'ai-rec':'scan'));
     else if(d.type==='THREAT_ANALYSIS') renderAIPanel(d);
-    else if(d.type==='EMITTER_TABLE') renderEmitterTable(d);
-    else if(d.type==='AGENT_STATUS') handleAgentStatus(d);
-    else if(d.type==='ALERT') handleAlert(d);
+    else if(d.type==='LLM_TRACE') renderLLMTrace(d);
+    else if(d.type==='IQ_DIAGNOSTICS'){
+          let html = `<div style="margin-bottom:8px"><b>FREQ:</b> <span style="color:var(--cyan)">${d.freq_mhz.toFixed(2)} MHz</span></div>`;
+          html += `<div style="margin-bottom:8px"><b>MODULATION:</b> <span style="${d.confidence>80?'color:var(--green);font-weight:bold':'color:var(--amber);font-weight:bold'}">${d.modulation}</span> (${d.confidence}% conf)</div>`;
+          html += `<div style="margin-bottom:8px"><b>BURSTS:</b> ${d.bursts}</div>`;
+          if (d.fsk_dev > 0) html += `<div style="margin-bottom:8px"><b>FSK DEVIATION:</b> <span style="color:var(--cyan)">${d.fsk_dev.toFixed(2)} kHz</span></div>`;
+          if (d.fft_peaks && d.fft_peaks.length > 0) {
+            html += `<div style="margin-top:12px;margin-bottom:4px;border-bottom:1px solid #333;padding-bottom:2px;color:var(--text-dim)"><b>FFT PEAKS (Relative to CC)</b></div>`;
+            d.fft_peaks.forEach(p => {
+              html += `<div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;padding:3px 0">
+                 <span>${(p.freq_mhz_offset > 0 ? '+' : '')}${p.freq_mhz_offset.toFixed(4)} MHz</span>
+                 <span style="color:var(--text-dim)">${p.power_db.toFixed(1)} dB</span>
+              </div>`;
+            });
+          }
+          document.getElementById('iq-panel').innerHTML = html;
+        }
+        else if(d.type==='EMITTER_TABLE') renderEmitterTable(d);
+        else if(d.type==='AGENT_STATUS') handleAgentStatus(d);
+        else if(d.type==='ALERT') handleAlert(d);
   };
 }
 addLog('RECON-1 v2.0','scan');
@@ -309,8 +441,36 @@ connect();
 </body>
 </html>""").replace("__WS_PORT__", str(ws_port))
 
+# ──────────────────────────────── HTTP Server ─────────────────────────────────
+
+class DashboardHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, ws_port=8081, **kwargs):
+        self.ws_port = ws_port
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            html = get_html(self.ws_port)
+            self.wfile.write(html.encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress normal http logs
+
+def start_http_server(port, ws_port):
+    handler = lambda *args, **kwargs: DashboardHandler(*args, ws_port=ws_port, **kwargs)
+    httpd = HTTPServer(('0.0.0.0', port), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd
 
 # ──────────────────────────────── Sweep Parsing ───────────────────────────────
+
 
 def parse_sweep_line(line: str):
     parts = line.strip().split(",")
@@ -422,7 +582,7 @@ async def ws_handler(websocket):
             try:
                 cmd = json.loads(message)
                 ctype = cmd.get("type", "")
-                if ctype in ("LOG", "THREAT_ANALYSIS", "EMITTER_TABLE", "AGENT_STATUS", "TIMELINE_DATA", "ALERT"):
+                if ctype in ("LOG", "THREAT_ANALYSIS", "EMITTER_TABLE", "AGENT_STATUS", "TIMELINE_DATA", "ALERT", "IQ_DIAGNOSTICS", "SETTINGS", "LLM_TRACE"):
                     # Forward agent messages to all browser clients
                     await broadcast(cmd)
                 elif ctype == "CMD":
@@ -430,6 +590,14 @@ async def ws_handler(websocket):
                     if action == "CAPTURE":
                         freq_hz = cmd.get("freq_hz")
                         asyncio.create_task(do_native_capture(freq_hz))
+                    elif action == "PAUSE_SWEEP":
+                        print("[SWEEP] PAUSING for IQ capture...")
+                        running_flag["run"] = False
+                    elif action == "RESUME_SWEEP":
+                        print("[SWEEP] RESUMING sweep...")
+                        if not running_flag["run"]:
+                            running_flag["run"] = True
+                            asyncio.create_task(run_real_sweep(running_flag))
                 else:
                     print(f"[WS] Received: {ctype}")
             except json.JSONDecodeError:
@@ -441,14 +609,16 @@ async def ws_handler(websocket):
 
 
 async def broadcast(data: dict):
+    """Non-blocking broadcast — never lets a slow client freeze the graph."""
     if not connected_clients:
         return
     msg = json.dumps(data)
     stale = set()
-    # Iterate over a copy to avoid "Set changed size during iteration"
     for ws in list(connected_clients):
         try:
-            await ws.send(msg)
+            await asyncio.wait_for(ws.send(msg), timeout=0.1)
+        except asyncio.TimeoutError:
+            pass  # Skip slow clients (agent busy with LLM), don't disconnect
         except Exception:
             stale.add(ws)
     connected_clients.difference_update(stale)

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 # Try common install locations
 RTL_433_PATHS = [
+    r"c:\Users\Littlin\Desktop\Hackathon\rtl_433.exe",
     r"C:\Program Files\rtl_433\rtl_433.exe",
     r"C:\Program Files\PothosSDR\bin\rtl_433.exe",
     r"C:\PothosSDR\bin\rtl_433.exe",

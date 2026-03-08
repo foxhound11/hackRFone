@@ -61,6 +61,9 @@ def upsert_emitter(freq_mhz, snr_db, power_db, agent_label="", threat_level=""):
         new_max_snr = max(existing["max_snr"], snr_db)
         new_max_power = max(existing["max_power"], power_db)
         new_label = agent_label if agent_label else existing["agent_label"]
+        # Do not let a frequency guess overwrite a confirmed protocol decode
+        if existing["agent_label"].startswith("CONFIRMED:") and not agent_label.startswith("CONFIRMED:"):
+            new_label = existing["agent_label"]
         new_threat = threat_level if threat_level else existing["threat_level"]
         conn.execute("""
             UPDATE emitters SET last_seen=?, total_hits=?, max_snr=?, avg_snr=?,
